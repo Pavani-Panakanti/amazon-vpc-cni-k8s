@@ -73,12 +73,6 @@ message DelNetworkReply {
   // next field: 7
 }
 
-message DeleteNpRequest {
-  bool Success = 1;
-	string K8S_POD_NAME = 2;
-	string K8S_POD_NAMESPACE = 3;
-}
-
 // The service definition.
 service NPBackend {
   rpc EnforceNpToPod (EnforceNpRequest) returns (EnforceNpReply) {}
@@ -96,6 +90,11 @@ message EnforceNpReply {
   bool Success = 1;
 }
 
+message DeleteNpRequest {
+  string K8S_POD_NAME = 1;
+  string K8S_POD_NAMESPACE = 2;
+}
+
 message DeleteNpReply {
   bool Success = 1;
 }
@@ -107,4 +106,6 @@ service ConfigServerBackend {
 
 message NetworkPolicyAgentConfigReply {
   string NetworkPolicyMode = 1;
+  int32 NumNetworkCards = 2;
+  bool MultiNICEnabled = 3;
 }
