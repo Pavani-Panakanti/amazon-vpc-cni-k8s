@@ -15,14 +15,17 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/procsyswrapper"
 	"github.com/aws/amazon-vpc-cni-k8s/utils"
 	"github.com/aws/amazon-vpc-cni-k8s/utils/cp"
 	"github.com/aws/amazon-vpc-cni-k8s/utils/imds"
 
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 )
@@ -140,6 +143,50 @@ func configureIPv6Settings(procSys procsyswrapper.ProcSys, primaryIF string) err
 	return nil
 }
 
+func dumpNICDriverMap(filePath string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return errors.Wrap(err, "failed to list netlink interfaces")
+	}
+
+	f, err := os.Create(filePath)
+	if err != nil {
+		return errors.Wrap(err, "failed to create NIC driver map file")
+	}
+	defer f.Close()
+
+	for _, link := range links {
+		linkName := link.Attrs().Name
+		mac := strings.ToLower(link.Attrs().HardwareAddr.String())
+
+		// Resolve PCI device path
+		pciPath := fmt.Sprintf("/sys/class/net/%s/device", linkName)
+		pciRealPath, err := os.Readlink(pciPath)
+		if err != nil {
+			log.WithError(err).Warnf("Skipping interface %s (cannot resolve PCI path)", linkName)
+			continue
+		}
+		pciSlot := filepath.Base(pciRealPath)
+
+		driverLink := filepath.Join(pciPath, "driver")
+		driverPath, err := os.Readlink(driverLink)
+		if err != nil {
+			log.WithError(err).Warnf("Skipping interface %s (cannot resolve driver path)", linkName)
+			continue
+		}
+		driver := filepath.Base(driverPath)
+
+		entry := fmt.Sprintf("%s -> %s [%s] (%s)\n", mac, driver, linkName, pciSlot)
+		if _, err := f.WriteString(entry); err != nil {
+			log.WithError(err).Warnf("Failed to write NIC entry for %s", linkName)
+			continue
+		}
+		log.Infof("Discovered NIC %s → %s", mac, driver)
+	}
+
+	return nil
+}
+
 func main() {
 	os.Exit(_main())
 }
@@ -178,6 +225,13 @@ func _main() int {
 	if err != nil {
 		log.WithError(err).Errorf("Failed to configure IPv6 settings")
 		return 1
+	}
+
+	mapPath := filepath.Join(defaultHostCNIBinPath, "nic_driver_map.txt")
+	if err := dumpNICDriverMap(mapPath); err != nil {
+		log.WithError(err).Warn("NIC driver map dump failed")
+	} else {
+		log.Infof("NIC driver map written to %s", mapPath)
 	}
 
 	log.Infof("CNI init container done")
