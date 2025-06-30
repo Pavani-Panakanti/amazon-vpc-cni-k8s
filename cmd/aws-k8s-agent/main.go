@@ -15,7 +15,9 @@
 package main
 
 import (
+	"context"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd"
@@ -25,6 +27,7 @@ import (
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/version"
 	"github.com/aws/amazon-vpc-cni-k8s/utils"
 	metrics "github.com/aws/amazon-vpc-cni-k8s/utils/prometheusmetrics"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -68,7 +71,7 @@ func startBackgroundAPIServerCheck(ipamContext *ipamd.IPAMContext) {
 		}
 
 		// Keep checking until connection is established
-		for {
+		wait.PollUntilContextCancel(context.Background(), pollInterval, true, func(ctx context.Context) (bool, error) {
 			version, err := clientSet.Discovery().ServerVersion()
 			if err == nil {
 				log.Infof("API server connectivity established in background! Cluster Version is: %s", version.GitVersion)
@@ -78,16 +81,19 @@ func startBackgroundAPIServerCheck(ipamContext *ipamd.IPAMContext) {
 
 				// Exit the goroutine after successful connection
 				log.Info("Background API server check completed successfully")
-				return
+				return true, nil
 			}
 
 			log.Debugf("Still waiting for API server connectivity in background: %v", err)
-			time.Sleep(pollInterval)
-		}
+			return false, nil
+		})
 	}()
 }
 
 func _main() int {
+	// Start measuring full startup duration
+	startupStartTime := time.Now()
+
 	// Do not add anything before initializing logger
 	log := logger.Get()
 
@@ -103,6 +109,8 @@ func _main() int {
 		log.Info("SGP, custom networking or pod annotation feature is in use, waiting for API server connectivity to start IPAMD")
 		if err := k8sapi.CheckAPIServerConnectivity(); err != nil {
 			log.Errorf("Failed to check API server connectivity: %s", err)
+			// Record failed startup
+			metrics.IpamdStartupDuration.WithLabelValues("false", strconv.FormatBool(withApiServer), "api_server_connectivity").Observe(time.Since(startupStartTime).Seconds())
 			return 1
 		} else {
 			log.Info("API server connectivity established.")
@@ -129,11 +137,21 @@ func _main() int {
 		log.Errorf("Failed to create event recorder: %s", err)
 		log.Warn("Skipping event recorder initialization")
 	}
+	// Measure node initialization duration
+	IPAMDNodeInitStartTime := time.Now()
 	ipamContext, err := ipamd.New(k8sClient, withApiServer)
+	IPAMDNodeInitDuration := time.Since(IPAMDNodeInitStartTime).Seconds()
+
 	if err != nil {
 		log.Errorf("Initialization failure: %v", err)
+		// Record failed IPAMD initialization and failed startup
+		metrics.IpamdNodeInitDuration.WithLabelValues("false").Observe(IPAMDNodeInitDuration)
+		metrics.IpamdStartupDuration.WithLabelValues("false", strconv.FormatBool(withApiServer), "node_initialization").Observe(time.Since(startupStartTime).Seconds())
 		return 1
 	}
+
+	// Record successful AWS initialization
+	metrics.IpamdNodeInitDuration.WithLabelValues("true").Observe(IPAMDNodeInitDuration)
 
 	// If not connected to API server yet, start background checks
 	if !withApiServer {
@@ -153,7 +171,10 @@ func _main() int {
 		go ipamContext.ServeIntrospection()
 	}
 
-	// Start the RPC listener
+	// Record successful startup duration before the blocking RPC handler call
+	metrics.IpamdStartupDuration.WithLabelValues("true", strconv.FormatBool(withApiServer), "").Observe(time.Since(startupStartTime).Seconds())
+
+	// Start the RPC listener (this is a blocking call)
 	err = ipamContext.RunRPCHandler(version.Version)
 	if err != nil {
 		log.Errorf("Failed to set up gRPC handler: %v", err)
